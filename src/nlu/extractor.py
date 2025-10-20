@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 
 from src.models.rules import RuleType
 
-# Lazy load the spacy model to avoid loading it on module import
+# Lazy-load the spaCy model so importing this module is cheap.
 NLP = None
 
 def get_nlp():
@@ -26,7 +26,7 @@ class Intent(str, Enum):
 
 class ExtractionResult(BaseModel):
     """Structured result of the NLU extraction process."""
-    intent: Optional[Intent = Field(None, description="The user's primary goal.")
+    intent: Optional[Intent] = Field(None, description="The user's primary goal.")
     rule_type: Optional[RuleType] = Field(None, description="The type of rule to be generated.")
     application_name: Optional[str] = Field(None, description="The name of the target application.")
     source_attributes: List[str] = Field(default_factory=list, description="Source attribute names.")
@@ -40,7 +40,7 @@ def _extract_intent(text: str) -> Optional[Intent]:
         return Intent.GENERATE_RULE
     if any(verb in text_lower for verb in ["change", "modify", "update", "amend"]):
         return Intent.MODIFY_RULE
-    if any(verb in text_lower for verb in ["explain", "describe", "what is"]):
+    if any(phrase in text_lower for phrase in ["explain", "describe", "what is"]):
         return Intent.EXPLAIN_RULE
     return None
 
@@ -57,42 +57,61 @@ def _extract_rule_type(text: str) -> Optional[RuleType]:
     return None
 
 
-def _extract_application(doc: spacy.tokens.Doc) -> Optional[str:
-    """Extracts application name, which is often a noun phrase after a preposition."""
-    # Prepositions that often precede an application name
+def _extract_application(doc: "spacy.tokens.Doc") -> Optional[str]:
+    """
+    Extract application name: often the object of a preposition like
+    'for <APP>', 'from <APP>', 'on <APP>'.
+    """
     prepositions = {"for", "from", "on"}
-
+    # Prefer prepositional objects (pobj) headed by a preposition we care about
+    for token in doc:
+        if token.dep_ == "pobj" and token.head.text.lower() in prepositions:
+            # return the full noun chunk containing this token if possible
+            for chunk in doc.noun_chunks:
+                if token.i >= chunk.start and token.i < chunk.end:
+                    return chunk.text
+            return token.text
+    # fallback: scan noun chunks whose head is a preposition
     for chunk in doc.noun_chunks:
-        # The 'root' of a noun chunk is its main word (e.g., 'Directory' in 'Active Directory').
-        # The 'head' of that root is the word it's attached to (e.g., 'for').
-        if chunk.root.head.lower_ in prepositions:
+        if chunk.root.head.text.lower() in prepositions:
             return chunk.text
     return None
-def _extract_attributes(text: str) -> List[str:
-    """Extracts potential attribute names using regex (camelCase, snake_case, or quoted)."""
-    # Regex with capturing groups for the content we want. Each part is a group.
-    pattern = r"""
-        \b([a-z]+[A-Z][a-zA-Z0-9_*)\b |      # camelCase (e.g., sAMAccountName)
-        \b([a-z]+(?:_[a-z0-9+)+)\b |         # snake_case (e.g., employee_id)
-        '([a-zA-Z0-9_.]+)' |                  # single-quoted (e.g., 'name')
-        "([a-zA-Z0-9_.]+)"                    # double-quoted (e.g., "uid")
+
+
+# Precompile a more robust attribute pattern:
+# - camelCase / Pascal with at least one uppercase transition
+# - snake_case with at least one underscore
+# - single or double quoted tokens (strip quotes later)
+_ATTR_PATTERN = re.compile(
+    r"""(?x)
+    (?:\b[a-z]+[A-Z][A-Za-z0-9_]*\b)        # camelCase like sAMAccountName
+    |
+    (?:\b[a-z0-9]+(?:_[a-z0-9]+)+\b)         # snake_case like employee_id
+    |
+    (?:'([A-Za-z0-9_.]+)')                   # 'quoted'
+    |
+    (?:"([A-Za-z0-9_.]+)")                   # "quoted"
     """
-    matches = re.findall(pattern, text, re.VERBOSE)
-    # findall with groups returns a list of tuples, e.g., [('sAMAccountName', '', '', ''), ...]
-    # We need to flatten the list and remove the empty strings.
-    return [item for tpl in matches for item in tpl if item]
+)
+
+def _extract_attributes(text: str) -> List[str]:
+    """Extract potential attribute names (camelCase, snake_case, or quoted tokens)."""
+    results: List[str] = []
+    for match in _ATTR_PATTERN.finditer(text):
+        s = match.group(0)
+        # If matched from quoted groups, strip quotes via captured groups
+        g1, g2 = match.group(1), match.group(2)
+        if g1:
+            results.append(g1)
+        elif g2:
+            results.append(g2)
+        else:
+            results.append(s)
+    return results
 
 
 def extract_entities(text: str) -> ExtractionResult:
-    """
-    Processes a natural language string to extract IIQ rule components.
-
-    Args:
-        text: The natural language input from the user.
-
-    Returns:
-        An ExtractionResult object containing the extracted entities.
-    """
+    """Processes a natural language string to extract IIQ rule components."""
     nlp = get_nlp()
     doc = nlp(text)
 
@@ -101,11 +120,11 @@ def extract_entities(text: str) -> ExtractionResult:
     application = _extract_application(doc)
     attributes = _extract_attributes(text)
 
-    source_attrs = []
-    identity_attrs = []
+    source_attrs: List[str] = []
+    identity_attrs: List[str] = []
 
     # Simple logic to differentiate attributes for BuildMap rules
-    if rule_type == RuleType.BUILD_MAP and "map" in text.lower() and len(attributes) >= 2:
+    if rule_type == RuleType.BUILD_MAP and len(attributes) >= 2:
         source_attrs.append(attributes[0])
         identity_attrs.append(attributes[1])
     else:
